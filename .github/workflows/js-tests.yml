@@ -11,4 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Say hello from JS Tests
-        run: echo "Hello from JS Tests!"
+        run: |
+          echo "Hello from JS Tests!"
+          sleep 60
