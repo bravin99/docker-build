@@ -14,4 +14,4 @@ jobs:
       - name: Say hello from PHP Tests
         run: |
           echo "Hello from PHP Tests!"
-          sleep 60
+          sleep 50
