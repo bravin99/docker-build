@@ -1,0 +1,189 @@
+name: docker-build
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── PHP Tests ──────────────────────────────────────────────────────────
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: xdebug
+
+      - name: Test all PHP modules
+        run: |
+          set -euo pipefail
+          for module in */; do
+            if [ -f "${module}module.json" ] && [ -f "${module}composer.json" ]; then
+              echo "Testing PHP module: ${module}..."
+              cd "${module}"
+              composer install --no-progress --prefer-dist
+              vendor/bin/phpunit --coverage-text --coverage-clover=coverage.xml
+
+              # Parse coverage.xml and return covered*10000/total (integer, 2 implied decimal places)
+              # e.g. 95.43% => 9543; avoids bc dependency entirely
+              read COVERED TOTAL < <(php -r '
+                $file = "coverage.xml";
+                if (!is_file($file)) { fwrite(STDERR, "coverage.xml not found\n"); exit(2); }
+                libxml_use_internal_errors(true);
+                $xml = simplexml_load_file($file);
+                if ($xml === false) { fwrite(STDERR, "Failed to parse coverage.xml\n"); exit(2); }
+
+                // Aggregate all <metrics> nodes (project-level node sums all files)
+                $nodes = $xml->xpath("//metrics");
+                if (empty($nodes)) { fwrite(STDERR, "No <metrics> node found in coverage.xml\n"); exit(2); }
+
+                // Use the first top-level metrics node which carries aggregate totals
+                $m = $nodes[0];
+                $covered = (int)($m["coveredstatements"] ?? -1);
+                $total   = (int)($m["statements"] ?? -1);
+                if ($covered < 0 || $total < 0) {
+                  fwrite(STDERR, "Missing coveredstatements/statements attributes on <metrics>\n");
+                  exit(2);
+                }
+                echo $covered . " " . $total . "\n";
+              ')
+              if [[ -z "$COVERED" || -z "$TOTAL" ]]; then
+                echo "Failed to extract coverage metrics from coverage.xml"
+                exit 1
+              fi
+              # Integer-only comparison: coverage% * 100 as integer, threshold 90*100=9000
+              if [[ "$TOTAL" -eq 0 ]]; then
+                echo "No statements found in coverage report; treating as 0% coverage"
+                PCT_INT=0
+              else
+                PCT_INT=$(( COVERED * 10000 / TOTAL ))
+              fi
+              PCT_DISPLAY="${PCT_INT:0:-2}.${PCT_INT: -2}"
+              echo "${module} coverage: ${PCT_DISPLAY}%"
+              if [[ "$PCT_INT" -lt 9000 ]]; then
+                echo "Coverage ${PCT_DISPLAY}% is below the 90% threshold"
+                exit 1
+              fi
+              cd "$GITHUB_WORKSPACE"
+            fi
+          done
+
+      # ── JS Tests ───────────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-24-${{ hashFiles('**/react-app/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-24-
+
+      - name: Test all JS modules with coverage
+        run: |
+          set -euo pipefail
+          for module in */; do
+            if [ -f "${module}module.json" ] && [ -f "${module}package.json" ] && [ ! -d "${module}react-app" ]; then
+              if node -e "const p=require('./${module}package.json'); process.exit(p.scripts && p.scripts['test:js:coverage'] ? 0 : 1)" 2>/dev/null; then
+                echo "Testing JS module: ${module}..."
+                cd "${module}"
+                npm run test:js:coverage
+                cd "$GITHUB_WORKSPACE"
+              fi
+            fi
+          done
+        env:
+          CI: true
+
+      - name: Install and test all React modules
+        run: |
+          for module in */; do
+            if [ -f "${module}module.json" ] && [ -d "${module}react-app" ]; then
+              echo "Testing React app for ${module}..."
+              cd "${module}react-app"
+              npm ci
+              npm test
+              cd "$GITHUB_WORKSPACE"
+            fi
+          done
+        env:
+          CI: true
+
+      # ── Docker ─────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Determine environment and tags
+        id: vars
+        run: |
+          set -euo pipefail
+          ref=${GITHUB_REF#refs/heads/}
+          if [ "$ref" = "main" ]; then
+            env=prod
+            target_branch=master
+          elif [ "$ref" = "staging" ]; then
+            env=staging
+            target_branch=staging
+          else
+            env=dev
+            target_branch=dev
+          fi
+          # Python (always present on ubuntu-latest) for decimal arithmetic; no bc needed
+          tag=$(python3 -c "print(f'{int($GITHUB_RUN_NUMBER) * 0.01:.2f}')")
+          prev_tag=$(python3 -c "print(f'{(int($GITHUB_RUN_NUMBER) - 1) * 0.01:.2f}')")
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "previous-tag=$prev_tag" >> $GITHUB_OUTPUT
+          echo "env=$env" >> $GITHUB_OUTPUT
+          echo "branch=$target_branch" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          push: true
+          context: .
+          tags: |
+            truehostcloud/whmcs-modules:${{ steps.vars.outputs.tag }}-${{ steps.vars.outputs.env }}
+          build-args: |
+            CACHEBUST=${{ github.sha }}
+          cache-from: type=registry,ref=truehostcloud/whmcs-modules:${{ steps.vars.outputs.previous-tag }}-${{ steps.vars.outputs.env }}-buildcache
+          cache-to: type=registry,ref=truehostcloud/whmcs-modules:${{ steps.vars.outputs.tag }}-${{ steps.vars.outputs.env }}-buildcache,mode=max
+
+      # ── Update tcloud-whmcs ────────────────────────────────────────────────
+      - name: Update module tag in tcloud-whmcs
+        env:
+          GH_TOKEN: ${{ secrets.WHMCS_REPOSITORY_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh variable set "ADDONS_TAG" \
+            --repo truehostcloud/tcloud-whmcs \
+            --body "${{ steps.vars.outputs.tag }}-${{ steps.vars.outputs.env }}"
+
+      - name: Trigger docker workflow in tcloud-whmcs
+        env:
+          GH_TOKEN: ${{ secrets.WHMCS_REPOSITORY_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run docker.yml \
+            --repo truehostcloud/tcloud-whmcs \
+            --ref ${{ steps.vars.outputs.branch }}
+          echo "Dispatched docker.yml to tcloud-whmcs on branch ${{ steps.vars.outputs.branch }}"

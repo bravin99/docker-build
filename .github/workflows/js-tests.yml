@@ -1,0 +1,14 @@
+name: JS Tests
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello from JS Tests
+        run: echo "Hello from JS Tests!"

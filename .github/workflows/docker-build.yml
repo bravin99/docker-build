@@ -1,0 +1,43 @@
+name: docker-build
+
+on:
+  workflow_run:
+    workflows: ["PHP Tests", "JS Tests"]
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check both test workflows passed for this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          for workflow in "PHP Tests" "JS Tests"; do
+            result=$(gh run list \
+              --repo "$REPO" \
+              --workflow "$workflow" \
+              --commit "$SHA" \
+              --limit 1 \
+              --json conclusion \
+              --jq '.[0].conclusion')
+            echo "$workflow conclusion: $result"
+            if [ "$result" != "success" ]; then
+              echo "$workflow has not succeeded for $SHA — blocking build"
+              exit 1
+            fi
+          done
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello from Docker Build
+        run: echo "Hello from Docker Build! Both tests passed."

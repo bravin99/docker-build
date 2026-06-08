@@ -1,0 +1,90 @@
+name: PHP Tests
+
+on:
+  workflow_run:
+    workflows: ["docker-build"]
+    types:
+      - completed
+
+jobs:
+  discover:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Discover testable modules
+        id: find
+        run: |
+          modules=$(find . -name "phpunit.xml" \
+            -not -path "./.git/*" \
+            -not -path "*/vendor/*" \
+            | xargs -I{} dirname {} \
+            | sed 's|^\./||' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          if [ "$modules" = "[]" ]; then
+            echo "No testable modules found (no phpunit.xml detected). Failing."
+            exit 1
+          fi
+
+  test:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.discover.outputs.modules) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: xdebug
+
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist
+        working-directory: ${{ matrix.module }}
+
+      - name: Run tests with coverage
+        run: vendor/bin/phpunit --coverage-text --coverage-clover=coverage.xml
+        working-directory: ${{ matrix.module }}
+
+      - name: Show uncovered lines
+        if: always()
+        run: |
+          php -r "
+            \$xml = simplexml_load_file('coverage.xml');
+            foreach (\$xml->project->file as \$file) {
+              \$uncovered = [];
+              foreach (\$file->line as \$line) {
+                if ((string)\$line['type'] === 'stmt' && (int)\$line['count'] === 0) {
+                  \$uncovered[] = (int)\$line['num'];
+                }
+              }
+              if (!empty(\$uncovered)) {
+                echo basename((string)\$file['name']) . ': lines ' . implode(', ', \$uncovered) . PHP_EOL;
+              }
+            }
+          "
+        working-directory: ${{ matrix.module }}
+
+      - name: Check coverage threshold (90%)
+        run: |
+          LINES=$(php -r "
+            \$xml = simplexml_load_file('coverage.xml');
+            \$metrics = \$xml->project->metrics;
+            \$covered = (int)\$metrics['coveredstatements'];
+            \$total   = (int)\$metrics['statements'];
+            echo \$total > 0 ? round(\$covered / \$total * 100, 2) : 0;
+          ")
+          echo "Line coverage: ${LINES}%"
+          if (( $(echo "$LINES < 90" | bc -l) )); then
+            echo "Coverage ${LINES}% is below the 90% threshold"
+            exit 1
+          fi
+        working-directory: ${{ matrix.module }}
